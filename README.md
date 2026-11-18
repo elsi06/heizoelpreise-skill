@@ -1,6 +1,6 @@
 # Heizoelpreise Scraper
 
-A Node.js skill for OpenClaw that monitors heating oil prices in Switzerland from three major providers. It tracks price history in a local SQLite database and displays results via OpenClaw.
+A Node.js skill for Hermes that monitors heating oil prices in Switzerland from three major providers. It tracks price history in a local SQLite database and displays results via Hermes.
 
 ## Features
 
@@ -9,7 +9,7 @@ A Node.js skill for OpenClaw that monitors heating oil prices in Switzerland fro
 - **Price Calculation**: Prices are calculated based on amount in liters (per 100L pricing converted to total)
 - **Trend Analysis**: Calculates daily price changes (📈 Up / 📉 Down / ➡️ Stable)
 - **Price History**: Stores all price records in a local SQLite database (`data/prices.db`)
-- **OpenClaw Integration**: Results are displayed directly via OpenClaw messaging
+- **Hermes Integration**: Results are displayed directly via Hermes messaging
 
 ## Configuration
 
@@ -31,9 +31,9 @@ npm install
 
 ## Usage
 
-### Query Prices via OpenClaw
+### Query Prices via Hermes
 
-Simply ask OpenClaw for heating oil prices:
+Simply ask Hermes for heating oil prices:
 
 ```
 !heizoel [PLZ] [Liter]
@@ -69,7 +69,7 @@ heizoelpreise/
 │   ├── utils/
 │   │   └── logger.js       # Logging utility
 │   ├── config.js           # Configuration management
-│   └── openclaw.js         # OpenClaw integration
+│   └── openclaw.js         # Hermes integration
 ├── .env.example            # Example environment file
 ├── package.json
 └── README.md
@@ -92,7 +92,7 @@ The SQLite database (`data/prices.db`) stores price records with the following s
 
 ## Output Example
 
-Results are displayed via OpenClaw:
+Results are displayed via Hermes:
 
 ```
 🔥 Heizöl-Preise 📊

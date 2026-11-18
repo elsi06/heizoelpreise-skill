@@ -1,230 +1,156 @@
 const BaseAdapter = require('./BaseAdapter');
-const puppeteer = require('puppeteer');
 const logger = require('../utils/logger');
 const https = require('https');
 
 class CoopAdapter extends BaseAdapter {
     constructor() {
         super('Coop');
-        this.baseUrl = 'https://www.coop-heizoel.ch';
-        this.apiBaseUrl = 'https://api.coop-heizoel.ch/occ/v2/cma/heatingOil';
+        this.apiBaseUrl = 'https://api.coop-heizoel.ch/occ/v2/cma';
+        // SAP material codes for Coop heating oil products
+        this.materialCodes = {
+            heating_oil: '1302',
+            heating_oil_20: '1301'
+        };
     }
 
     async fetchPrice(zipCode, amount) {
-        // Coop API has shown inconsistent unit semantics in production.
-        // Use browser-visible price as primary source, API only as last-resort fallback.
-        return this.fetchPriceViaBrowser(zipCode, amount);
+        // 1. Get delivery weeks from pricediagram to find earliest available date
+        const diagram = await this.fetchDiagramData(zipCode);
+        const earliestWeek = this.findEarliestWeek(diagram);
+
+        // 2. Call order-simulate with the real SAP pricing engine
+        const deliveryFrom = earliestWeek.from;
+        const deliveryTo = this.addDaysIso(deliveryFrom, 14);
+        const simulation = await this.fetchSimulation(zipCode, amount, deliveryFrom, deliveryTo);
+
+        // 3. Extract gross price (inkl. MwSt) — that's what the website displays
+        const item = this.extractOrderItem(simulation);
+        if (!item) {
+            throw new Error('No order item in simulation response');
+        }
+
+        const grossTotal = parseFloat(item.grossAmount);
+        const per100L = grossTotal / (amount / 100);
+
+        // Plausibility: CH heating oil typically 80–250 CHF/100L
+        if (!Number.isFinite(per100L) || per100L < 50 || per100L > 300) {
+            throw new Error(`Implausible price: ${per100L.toFixed(2)} CHF/100L (gross total: ${grossTotal})`);
+        }
+
+        logger.info(`Coop simulate: ${grossTotal.toFixed(2)} CHF total → ${per100L.toFixed(2)} CHF/100L for ${amount}L (delivery ${deliveryFrom})`);
+        return this.createPriceObject(grossTotal.toFixed(2), 'CHF', zipCode, amount);
     }
 
-    getDeliveryDate() {
-        // Get date 14 days from now (Coop usually delivers 2+ weeks out)
-        const date = new Date();
-        date.setDate(date.getDate() + 14);
+    fetchDiagramData(zipCode) {
+        const url = `${this.apiBaseUrl}/prices/pricediagram/${zipCode}?lang=de&curr=CHF`;
+        logger.info(`Coop diagram: ${url}`);
+        return this.httpGetJson(url);
+    }
+
+    findEarliestWeek(diagram) {
+        const offsetDays = parseInt(diagram.earliestDeliveryOffsetDays || '8', 10);
+        const weeks = diagram.weeks || [];
+        const now = new Date();
+        const minDate = new Date(now.getTime() + offsetDays * 86400000);
+        for (const w of weeks) {
+            const fromDate = new Date(w.from);
+            if (fromDate >= minDate) {
+                return { week: w.week, from: w.from.split('T')[0], to: w.to.split('T')[0], surcharge: w.price };
+            }
+        }
+        // Fallback: first week
+        if (weeks.length > 0) {
+            return { week: weeks[0].week, from: weeks[0].from.split('T')[0], to: weeks[0].to.split('T')[0], surcharge: weeks[0].price };
+        }
+        // Last resort: 14 days from now
+        const from = new Date(now.getTime() + 14 * 86400000).toISOString().split('T')[0];
+        return { week: 0, from, to: this.addDaysIso(from, 7), surcharge: 0 };
+    }
+
+    fetchSimulation(zipCode, amount, deliveryFrom, deliveryTo) {
+        const url = `${this.apiBaseUrl}/order/order-simulate?orderCount=1&lang=de&curr=CHF`;
+        const body = JSON.stringify({
+            postalCode: String(zipCode),
+            volume: String(amount),
+            salesOrderItems: [
+                { position: '10', material: this.materialCodes.heating_oil, requestedQuantity: String(amount), salesUnit: 'L15' }
+            ],
+            deliveryFrom,
+            deliveryTo
+        });
+        logger.info(`Coop simulate: POST ${url} (zip=${zipCode}, vol=${amount}, delivery=${deliveryFrom})`);
+        return this.httpPostJson(url, body);
+    }
+
+    extractOrderItem(simulation) {
+        const simType = simulation?.salesOrderSimulation?.salesOrderSimulationType;
+        if (!simType) return null;
+        const items = simType?.toItem?.salesOrderItemSimulationType
+            ?? simType?.to_Item?.A_SalesOrderItemSimulationType
+            ?? [];
+        return items.find(i => i.material === this.materialCodes.heating_oil) || items[0] || null;
+    }
+
+    addDaysIso(isoDate, days) {
+        const [y, m, d] = isoDate.split('-').map(Number);
+        const date = new Date(Date.UTC(y, m - 1, d));
+        date.setUTCDate(date.getUTCDate() + days);
         return date.toISOString().split('T')[0];
     }
 
-    fetchFromApi(zipCode, amount, deliveryDate) {
+    httpGetJson(url) {
         return new Promise((resolve, reject) => {
-            const url = `${this.apiBaseUrl}/productsForPostalcodesAndVolume?postalCode=${zipCode}&volume=${amount}&deliveryDate=${deliveryDate}&productCodes=heating_oil&lang=de&curr=CHF`;
-            
-            logger.info(`Fetching price from API: ${url}`);
-            
-            https.get(url, (res) => {
+            const options = {
+                headers: {
+                    'Accept': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            };
+            https.get(url, options, (res) => {
                 let data = '';
                 res.on('data', chunk => data += chunk);
                 res.on('end', () => {
-                    try {
-                        const json = JSON.parse(data);
-                        
-                        // Extract price from API response
-                        if (json.products && json.products[0] && json.products[0].price) {
-                            const price = json.products[0].price.value;
-                            logger.info(`Got price from API: ${price} CHF per 1000L`);
-                            resolve(price);
-                        } else {
-                            reject(new Error('No price found in API response'));
-                        }
-                    } catch (e) {
-                        reject(new Error(`Failed to parse API response: ${e.message}`));
+                    if (res.statusCode !== 200) {
+                        reject(new Error(`HTTP ${res.statusCode} from ${url}`));
+                        return;
                     }
+                    try { resolve(JSON.parse(data)); }
+                    catch (e) { reject(new Error(`JSON parse failed: ${e.message}`)); }
                 });
-            }).on('error', (e) => {
-                reject(e);
-            });
+            }).on('error', reject);
         });
     }
 
-    async fetchPriceViaBrowser(zipCode, amount) {
-        let browser;
-        try {
-            browser = await puppeteer.launch({
-                headless: "new",
-                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    httpPostJson(url, body) {
+        return new Promise((resolve, reject) => {
+            const urlObj = new URL(url);
+            const options = {
+                hostname: urlObj.hostname,
+                path: urlObj.pathname + urlObj.search,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Content-Length': Buffer.byteLength(body)
+                }
+            };
+            const req = https.request(urlObj, options, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    if (res.statusCode !== 200) {
+                        reject(new Error(`HTTP ${res.statusCode} from ${url}: ${data.substring(0, 200)}`));
+                        return;
+                    }
+                    try { resolve(JSON.parse(data)); }
+                    catch (e) { reject(new Error(`JSON parse failed: ${e.message}`)); }
+                });
             });
-
-            const page = await browser.newPage();
-            await page.setViewport({ width: 1280, height: 800 });
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-
-            // Network monitoring
-            let priceData = null;
-            page.on('response', async (response) => {
-                const url = response.url();
-                if (url.includes('productsForPostalcodesAndVolume') && response.status() === 200) {
-                    try {
-                        const json = await response.json().catch(() => null);
-                        if (json && json.products && json.products[0] && json.products[0].price) {
-                            logger.info(`Captured price API from: ${url}`);
-                            priceData = json;
-                        }
-                    } catch (e) {}
-                }
-            });
-
-            logger.info(`Opening ${this.baseUrl}/de/`);
-            await page.goto(`${this.baseUrl}/de/`, { waitUntil: 'networkidle0', timeout: 60000 });
-
-            // Wait for Angular to bootstrap
-            await page.waitForFunction(() => {
-                return window.location.href.includes('coop-heizoel');
-            }, { timeout: 30000 });
-
-            // Wait a bit for Angular to initialize
-            await new Promise(r => setTimeout(r, 3000));
-
-            // Use page.evaluate to interact with Angular form directly
-            const formResult = await page.evaluate(async (zip, menge) => {
-                // Find form fields using Angular attributes or plain IDs if available
-                const zipInput = document.querySelector('#zipCode');
-                const amountInput = document.querySelector('#value'); // Fix: Coop uses #value for amount now
-                
-                // Try to fill inputs
-                if (zipInput) {
-                    zipInput.value = zip;
-                    zipInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    zipInput.dispatchEvent(new Event('change', { bubbles: true }));
-                    zipInput.dispatchEvent(new Event('blur', { bubbles: true }));
-                }
-                
-                if (amountInput) {
-                    amountInput.value = menge;
-                    amountInput.dispatchEvent(new Event('input', { bubbles: true }));
-                    amountInput.dispatchEvent(new Event('change', { bubbles: true }));
-                    amountInput.dispatchEvent(new Event('blur', { bubbles: true }));
-                }
-                
-                return {
-                    zipFound: !!zipInput,
-                    amountFound: !!amountInput,
-                    zipValue: zipInput?.value,
-                    amountValue: amountInput?.value
-                };
-            }, zipCode, amount);
-
-            logger.info(`Form fill result: ${JSON.stringify(formResult)}`);
-
-            // Wait until zip dropdown appears, then select first match
-            try {
-                // Coop sometimes uses .dropdown-menu or similar for autocomplete
-                await page.waitForSelector('.dropdown-item, .autocomplete-result, .typeahead-item, mat-option', { timeout: 15000 });
-                const items = await page.$$('.dropdown-item, .autocomplete-result, .typeahead-item, mat-option');
-                if (items.length > 0) {
-                    await items[0].click();
-                    logger.info('Coop: Selected ZIP from dropdown');
-                }
-            } catch (e) {
-                // For some ZIPs no explicit dropdown selection may be needed.
-                logger.info('Coop: No explicit ZIP dropdown selection found or needed');
-            }
-
-            // Wait for valid form state (zip no longer pending + submit enabled)
-            await page.waitForFunction(() => {
-                const zip = document.querySelector('#zipCode');
-                const amount = document.querySelector('#value');
-                const btn = document.querySelector('button.submit');
-                const isZipValid = zip && (/ng-valid/.test(zip.className || ''));
-                const isAmountValid = amount && (/ng-valid/.test(amount.className || ''));
-                return !!zip && !!amount && !!btn && isZipValid && isAmountValid && btn.disabled === false;
-            }, { timeout: 30000 });
-
-            const submitBtn = await page.$('button.submit') || await page.$('button[type="submit"]');
-            if (submitBtn) {
-                await submitBtn.click();
-            } else {
-                throw new Error('Submit button not found');
-            }
-
-            // Wait for result area to render with total/price labels
-            await page.waitForFunction(() => {
-                const text = document.body.innerText || '';
-                return (text.includes('Preis pro 100 Liter') || text.includes('CHF/100L') || text.includes('Preis pro 100l')) && 
-                       (text.includes('Total') || text.includes('Gesamtbetrag'));
-            }, { timeout: 40000 });
-
-            const bodyText = await page.evaluate(() => document.body.innerText);
-            const parsed = this.extractDisplayedPrices(bodyText, amount);
-            if (parsed) {
-                logger.info(`Coop page result: ${parsed.per100.toFixed(2)} CHF/100L | Total ${parsed.total.toFixed(2)} CHF`);
-                return this.createPriceObject(parsed.total.toFixed(2), 'CHF', zipCode, amount);
-            }
-
-            // Log body for debugging if we get here
-            logger.warn(`Coop: page extraction failed. Body snippet: ${bodyText.substring(0, 500)}`);
-            throw new Error('Price extraction failed (page scraping)');
-
-        } catch (error) {
-            logger.error(`Error: ${error.message}`);
-            throw error;
-        } finally {
-            if (browser) await browser.close();
-        }
-    }
-
-    extractPriceFromApi(data) {
-        if (!data) return null;
-        if (data.products && data.products[0] && data.products[0].price) {
-            const price = data.products[0].price.value;
-            if (price && typeof price === 'number' && price > 50 && price < 200) return price;
-        }
-        return null;
-    }
-
-    parseChfNumber(str) {
-        if (!str) return NaN;
-        // Swiss formatting: 3'673,25
-        const normalized = str.replace(/'/g, '').replace(/\s/g, '').replace(',', '.');
-        return parseFloat(normalized);
-    }
-
-    extractDisplayedPrices(text, amount) {
-        if (!text) return null;
-
-        // Prefer explicit total shown by Coop result panel
-        const totalMatch = text.match(/Total\s*CHF\s*([0-9'.,]+)/i)
-            || text.match(/CHF\s*([0-9'.,]+)\s*\n\s*Total/i)
-            || text.match(/Abladestelle[^\n]*CHF\s*([0-9'.,]+)/i);
-
-        let total = totalMatch ? this.parseChfNumber(totalMatch[1]) : NaN;
-
-        // Optional explicit per100 label from page
-        const per100Match = text.match(/CHF\s*([0-9'.,]+)\s*\n\s*Preis pro 100 Liter/i)
-            || text.match(/Preis pro 100 Liter[^\n]*CHF\s*([0-9'.,]+)/i);
-        let per100 = per100Match ? this.parseChfNumber(per100Match[1]) : NaN;
-
-        if (!Number.isFinite(total) && Number.isFinite(per100)) {
-            total = per100 * (amount / 100);
-        }
-
-        if (!Number.isFinite(per100) && Number.isFinite(total)) {
-            per100 = total / (amount / 100);
-        }
-
-        // Plausibility bounds for CH heating oil
-        if (Number.isFinite(total) && Number.isFinite(per100) && per100 >= 60 && per100 <= 250) {
-            return { total, per100 };
-        }
-
-        return null;
+            req.on('error', reject);
+            req.write(body);
+            req.end();
+        });
     }
 }
 
